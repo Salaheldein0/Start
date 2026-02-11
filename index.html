@@ -72,16 +72,11 @@
   </div>
 
   <script>
-    // ===== Constants from your Python app =====
-    const RX_UUID = "569a2000-b87f-490c-92cb-11ba5ea5167c"; // notify: device -> host
-    const TX_UUID = "569a2001-b87f-490c-92cb-11ba5ea5167c"; // write: host -> device
-
-    // Known service UUID candidates (needed for browser permission model)
-    // IMPORTANT: optionalServices must contain SERVICE UUIDs, not characteristic UUIDs.
-    // We include both known UUIDs as requested by browser error guidance.
+    // ===== Constants =====
+    const RX_UUID = "569a2000-b87f-490c-92cb-11ba5ea5167c";
+    const TX_UUID = "569a2001-b87f-490c-92cb-11ba5ea5167c";
     const OPTIONAL_SERVICE_UUIDS = [RX_UUID, TX_UUID];
 
-    // Reference info
     const DRYER4_ADDRESS = "30:30:f9:fe:4c:16";
     const WASHER1_ADV_NAME = "AWYDLOOBYZR1";
 
@@ -96,11 +91,7 @@
     };
 
     // ===== State =====
-    let device = null;
-    let server = null;
-    let rxChar = null;
-    let txChar = null;
-
+    let device = null, server = null, rxChar = null, txChar = null;
     let rxBuf = new Uint8Array(0);
     const messageQueue = [];
     let waiters = [];
@@ -111,4 +102,328 @@
     // ===== UI =====
     const els = {
       connectBtn: document.getElementById("connectBtn"),
-      disconnectBtn: document.getElementById("disconn
+      disconnectBtn: document.getElementById("disconnectBtn"),
+      washerBtn: document.getElementById("washerBtn"),
+      dryer15Btn: document.getElementById("dryer15Btn"),
+      dryerFullBtn: document.getElementById("dryerFullBtn"),
+      status: document.getElementById("status"),
+      log: document.getElementById("log"),
+      envNote: document.getElementById("envNote"),
+    };
+
+    function log(line, cls = "") {
+      const ts = new Date().toLocaleTimeString();
+      const text = `[${ts}] ${line}\n`;
+      if (cls) {
+        const span = document.createElement("span");
+        span.className = cls;
+        span.textContent = text;
+        els.log.appendChild(span);
+      } else {
+        els.log.appendChild(document.createTextNode(text));
+      }
+      els.log.scrollTop = els.log.scrollHeight;
+      console.log(line);
+    }
+
+    function setStatus(text, cls = "") {
+      els.status.className = "small " + cls;
+      els.status.textContent = "Status: " + text;
+    }
+
+    function setConnectedUi(connected) {
+      els.connectBtn.disabled = connected;
+      els.disconnectBtn.disabled = !connected;
+      els.washerBtn.disabled = !connected;
+      els.dryer15Btn.disabled = !connected;
+      els.dryerFullBtn.disabled = !connected;
+    }
+
+    function resetRx() {
+      rxBuf = new Uint8Array(0);
+      messageQueue.length = 0;
+      waiters.forEach(w => clearTimeout(w.timer));
+      waiters = [];
+    }
+
+    function concatUint8(a, b) {
+      const out = new Uint8Array(a.length + b.length);
+      out.set(a, 0);
+      out.set(b, a.length);
+      return out;
+    }
+
+    function extractFramesFromBuffer() {
+      const frames = [];
+      while (true) {
+        const start = rxBuf.indexOf("[".charCodeAt(0));
+        if (start < 0) { rxBuf = new Uint8Array(0); return frames; }
+        if (start > 0) rxBuf = rxBuf.slice(start);
+
+        const end = rxBuf.indexOf("]".charCodeAt(0), 1);
+        if (end < 0) return frames;
+
+        frames.push(rxBuf.slice(0, end + 1));
+        rxBuf = rxBuf.slice(end + 1);
+      }
+    }
+
+    function enqueueMessage(msg) {
+      messageQueue.push(msg);
+      resolveWaiters();
+    }
+
+    function resolveWaiters() {
+      if (!waiters.length || !messageQueue.length) return;
+      for (let i = 0; i < waiters.length; i++) {
+        const w = waiters[i];
+        const idx = messageQueue.findIndex(m => m.startsWith(w.prefix));
+        if (idx >= 0) {
+          const [msg] = messageQueue.splice(idx, 1);
+          clearTimeout(w.timer);
+          w.resolve(msg);
+          waiters.splice(i, 1);
+          i--;
+        }
+      }
+    }
+
+    function waitForPrefix(prefix, timeoutMs = 5000) {
+      const immediateIdx = messageQueue.findIndex(m => m.startsWith(prefix));
+      if (immediateIdx >= 0) {
+        const [msg] = messageQueue.splice(immediateIdx, 1);
+        return Promise.resolve(msg);
+      }
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          const idx = waiters.findIndex(w => w.resolve === resolve);
+          if (idx >= 0) waiters.splice(idx, 1);
+          reject(new Error(`Timed out waiting for ${prefix}`));
+        }, timeoutMs);
+        waiters.push({ prefix, resolve, reject, timer });
+      });
+    }
+
+    function onNotify(event) {
+      try {
+        const v = event.target.value;
+        const chunk = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+        rxBuf = concatUint8(rxBuf, chunk);
+        for (const raw of extractFramesFromBuffer()) {
+          const msg = dec.decode(raw);
+          log(`RX: ${msg}`);
+          enqueueMessage(msg);
+        }
+      } catch (e) {
+        log(`[WARN] Notify parse error: ${String(e)}`, "warn");
+      }
+    }
+
+    async function send(text, expectPrefix = null, timeoutMs = 5000) {
+      if (!txChar) throw new Error("Not connected");
+      log(`TX: ${text}`);
+      const bytes = enc.encode(text);
+
+      try {
+        await txChar.writeValueWithoutResponse(bytes);
+      } catch {
+        await txChar.writeValue(bytes);
+      }
+
+      if (expectPrefix) return await waitForPrefix(expectPrefix, timeoutMs);
+      return "";
+    }
+
+    async function runSequence(activateCmd) {
+      try {
+        await send(CMD.HANDSHAKE, "[ACK:HANDSHAKE]", 8000);
+        await send(CMD.VERSION, "[VERSION:", 8000);
+        await send(CMD.COIN_DISABLE, "[ACK:COIN]", 8000);
+        await send(activateCmd, "[ACK:ACTIVATE]", 8000);
+        await send(CMD.EXEC, "[ACK:EXEC]", 8000);
+        await new Promise(r => setTimeout(r, 500));
+        log("Result: SUCCESS", "ok");
+      } catch (e) {
+        log(`[ERROR] ${String(e)}`, "bad");
+        log("Result: FAILED", "bad");
+      }
+    }
+
+    async function findRxTxCharacteristics(gattServer) {
+      const rx = RX_UUID.toLowerCase();
+      const tx = TX_UUID.toLowerCase();
+
+      // Try direct by primary service first
+      try {
+        const svc = await gattServer.getPrimaryService(RX_UUID);
+        const chars = await svc.getCharacteristics();
+        let foundRx = null, foundTx = null;
+        for (const c of chars) {
+          const u = c.uuid.toLowerCase();
+          if (u === rx) foundRx = c;
+          if (u === tx) foundTx = c;
+        }
+        if (foundRx && foundTx) return { foundRx, foundTx };
+      } catch (_) {}
+
+      // Fallback: scan all granted primary services
+      const services = await gattServer.getPrimaryServices();
+      let foundRx = null, foundTx = null;
+      for (const s of services) {
+        const chars = await s.getCharacteristics();
+        for (const c of chars) {
+          const u = c.uuid.toLowerCase();
+          if (u === rx) foundRx = c;
+          if (u === tx) foundTx = c;
+        }
+      }
+
+      if (!foundRx || !foundTx) {
+        throw new Error("Connected, but RX/TX characteristics were not found. You may need the device's primary service UUID in optionalServices.");
+      }
+      return { foundRx, foundTx };
+    }
+
+    async function connect() {
+      log("[INFO] Connect clicked...");
+      if (!window.isSecureContext) {
+        log("[ERROR] Web Bluetooth requires HTTPS or localhost.", "bad");
+        setStatus("requires HTTPS/localhost", "bad");
+        return;
+      }
+      if (!navigator.bluetooth) {
+        log("[ERROR] Web Bluetooth not supported in this browser.", "bad");
+        setStatus("Web Bluetooth unsupported", "bad");
+        return;
+      }
+
+      try {
+        setStatus("opening chooser...");
+        resetRx();
+
+        // IMPORTANT: requestDevice is called directly in click flow
+        const chosenDevice = await navigator.bluetooth.requestDevice({
+          acceptAllDevices: true,
+          optionalServices: OPTIONAL_SERVICE_UUIDS
+        });
+
+        device = chosenDevice;
+        device.addEventListener("gattserverdisconnected", onDisconnected);
+
+        setStatus("connecting...");
+        server = await device.gatt.connect();
+
+        const { foundRx, foundTx } = await findRxTxCharacteristics(server);
+        rxChar = foundRx;
+        txChar = foundTx;
+
+        await rxChar.startNotifications();
+        rxChar.addEventListener("characteristicvaluechanged", onNotify);
+
+        setConnectedUi(true);
+        setStatus(`connected to ${device.name || "(unnamed device)"}`, "ok");
+        log(`[INFO] Connected to ${device.name || "device"}`, "ok");
+
+        if ((device.name || "") === WASHER1_ADV_NAME) {
+          log("[INFO] Selected device matches Washer 1 (AWYDLOOBYZR1).", "ok");
+        } else {
+          log("[INFO] If this is Dryer 4, continue. If not, disconnect and choose again.", "warn");
+        }
+      } catch (e) {
+        const msg = String(e);
+        if (msg.includes("NotFoundError")) {
+          log("[WARN] No device selected in chooser.", "warn");
+        } else {
+          log(`[ERROR] Connect failed: ${msg}`, "bad");
+        }
+        setStatus("connect failed", "bad");
+        await disconnect();
+      }
+    }
+
+    async function disconnect() {
+      try {
+        if (rxChar) {
+          try {
+            rxChar.removeEventListener("characteristicvaluechanged", onNotify);
+            await rxChar.stopNotifications();
+          } catch (e) {
+            log(`[WARN] stopNotifications issue: ${String(e)}`, "warn");
+          }
+        }
+        if (device?.gatt?.connected) {
+          device.gatt.disconnect();
+        }
+      } finally {
+        device = null;
+        server = null;
+        rxChar = null;
+        txChar = null;
+        resetRx();
+        setConnectedUi(false);
+        setStatus("not connected");
+        log("[INFO] Disconnected.");
+      }
+    }
+
+    function onDisconnected() {
+      log("[WARN] Device disconnected.", "warn");
+      device = null; server = null; rxChar = null; txChar = null;
+      resetRx();
+      setConnectedUi(false);
+      setStatus("disconnected", "warn");
+    }
+
+    // Wire buttons
+    els.connectBtn.addEventListener("click", async () => {
+      els.connectBtn.disabled = true;
+      try { await connect(); }
+      finally {
+        if (!device) els.connectBtn.disabled = false;
+      }
+    });
+
+    els.disconnectBtn.addEventListener("click", disconnect);
+
+    els.washerBtn.addEventListener("click", async () => {
+      log("Starting Washer 1: Full wash...");
+      await runSequence(CMD.ACTIVATE_WASHER_FULL);
+    });
+
+    els.dryer15Btn.addEventListener("click", async () => {
+      log("Starting Dryer 4: 15 min cycle...");
+      await runSequence(CMD.ACTIVATE_DRYER_15);
+    });
+
+    els.dryerFullBtn.addEventListener("click", async () => {
+      log("Starting Dryer 4: Full dry cycle...");
+      await runSequence(CMD.ACTIVATE_DRYER_FULL);
+    });
+
+    // Init
+    setConnectedUi(false);
+    log(`Use Washer 1 (${WASHER1_ADV_NAME})`);
+    log(`Use Dryer 4 for address ${DRYER4_ADDRESS}`);
+
+    const ua = navigator.userAgent || "";
+    const isFirefox = ua.toLowerCase().includes("firefox");
+    if (isFirefox) {
+      els.envNote.textContent = "You appear to be on Firefox. Web Bluetooth is typically unavailable there; use Chrome/Edge.";
+      log("[WARN] Firefox detected. Use Chrome/Edge for Web Bluetooth.", "warn");
+    } else if (!window.isSecureContext) {
+      els.envNote.textContent = "This page must be served over HTTPS (or localhost) for Web Bluetooth.";
+      log("[WARN] Insecure context detected. Use HTTPS or localhost.", "warn");
+    } else {
+      els.envNote.textContent = "";
+    }
+
+    // Capture uncaught errors into log so "does nothing" is diagnosable
+    window.addEventListener("error", (e) => {
+      log(`[ERROR] Uncaught: ${e.message}`, "bad");
+    });
+    window.addEventListener("unhandledrejection", (e) => {
+      log(`[ERROR] Promise rejection: ${String(e.reason)}`, "bad");
+    });
+  </script>
+</body>
+</html>
