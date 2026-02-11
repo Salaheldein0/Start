@@ -11,11 +11,11 @@
     h1 { font-size: 1.2rem; margin: 0 0 10px; }
     .card { background: #111827; border: 1px solid #334155; border-radius: 14px; padding: 14px; margin: 12px 0; }
     .row { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; }
-    button, input {
+    button {
       border: 1px solid #475569; background: #1e293b; color: #e2e8f0;
       padding: 10px 12px; border-radius: 10px; font-size: 0.95rem;
+      cursor: pointer;
     }
-    button { cursor: pointer; }
     button:hover { background: #273449; }
     button:disabled { opacity: 0.55; cursor: not-allowed; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
@@ -55,7 +55,7 @@
       <div class="map small">
         <strong>When selecting a device:</strong><br>
         Use <strong>Washer 1 (AWYDLOOBYZR1)</strong><br>
-        Use <strong>Dryer 4  (AW6S9672XUR1)</strong><br>
+        Use <strong>Dryer 4 (AW6S9672XUR1)</strong><br>
       </div>
     </div>
 
@@ -64,11 +64,6 @@
         <button id="washerBtn" disabled>Washer 1 - Full wash</button>
         <button id="dryer15Btn" disabled>Dryer 4 - 15 min cycle</button>
         <button id="dryerFullBtn" disabled>Dryer 4 - Full dry</button>
-      </div>
-
-      <div class="row">
-        <input id="customCmd" style="min-width:420px; flex:1;" value="[HANDSHAKE:ENABLE]" />
-        <button id="sendCustomBtn" disabled>Send Custom ASCII</button>
       </div>
     </div>
 
@@ -83,6 +78,10 @@
     const SERVICE_UUID = "569a1101-b87f-490c-92cb-11ba5ea5167c";
     const RX_UUID = "569a2000-b87f-490c-92cb-11ba5ea5167c"; // notify
     const TX_UUID = "569a2001-b87f-490c-92cb-11ba5ea5167c"; // write
+
+    // ===== Device labels =====
+    const WASHER1_ADV_NAME = "AWYDLOOBYZR1";
+    const DRYER4_ADV_NAME = "AW6S9672XUR1";
 
     // ===== Commands =====
     const CMD = {
@@ -116,8 +115,6 @@
       washerBtn: document.getElementById("washerBtn"),
       dryer15Btn: document.getElementById("dryer15Btn"),
       dryerFullBtn: document.getElementById("dryerFullBtn"),
-      customCmd: document.getElementById("customCmd"),
-      sendCustomBtn: document.getElementById("sendCustomBtn"),
       status: document.getElementById("status"),
       log: document.getElementById("log"),
     };
@@ -147,7 +144,6 @@
       els.washerBtn.disabled = !connected;
       els.dryer15Btn.disabled = !connected;
       els.dryerFullBtn.disabled = !connected;
-      els.sendCustomBtn.disabled = !connected;
     }
 
     function resetRx() {
@@ -291,7 +287,7 @@
 
         device = await navigator.bluetooth.requestDevice({
           acceptAllDevices: true,
-          optionalServices: [SERVICE_UUID] // critical fix
+          optionalServices: [SERVICE_UUID]
         });
 
         log(`[INFO] Chooser returned: ${device.name || "(unnamed)"} (${device.id || "no-id"})`);
@@ -388,20 +384,10 @@
       await runSequence(CMD.ACTIVATE_DRYER_FULL);
     });
 
-    els.sendCustomBtn.addEventListener("click", async () => {
-      const txt = (els.customCmd.value || "").trim();
-      if (!txt) return;
-      try {
-        await writeAscii(txt);
-      } catch (e) {
-        log(`[ERROR] Custom send failed: ${String(e)}`, "bad");
-      }
-    });
-
     // ===== Init =====
     setConnectedUI(false);
     log(`Use Washer 1 (${WASHER1_ADV_NAME})`);
-    log(`Use Dryer 4 for address ${DRYER4_ADDRESS}`);
+    log(`Use Dryer 4 (${DRYER4_ADV_NAME})`);
 
     const ua = navigator.userAgent || "";
     if (ua.toLowerCase().includes("firefox")) {
