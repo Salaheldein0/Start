@@ -28,6 +28,7 @@
     }
     .small { font-size: 0.85rem; color: #94a3b8; }
     .pill { display: inline-block; border: 1px solid #475569; border-radius: 999px; padding: 2px 8px; margin-left: 6px; font-size: 12px; color: #93c5fd; }
+    .map { margin-top: 8px; padding: 10px; border: 1px dashed #475569; border-radius: 10px; background: #0b1220; }
   </style>
 </head>
 <body>
@@ -47,15 +48,12 @@
         TX UUID: 569a2001-b87f-490c-92cb-11ba5ea5167c
       </p>
 
-      <p class="small mono">
-        Device addresses (from native script):<br>
-        • Washer 1: <strong>dc:da:0c:d6:e0:96</strong><br>
-        • Dryer 4: <strong>30:30:f9:fe:4c:16</strong>
-      </p>
-      <p class="small">
-        Note: Web Bluetooth may not expose/connect by MAC address directly in-browser;
-        these are reference mappings from your Python app.
-      </p>
+      <div class="map small">
+        <strong>When selecting a device:</strong><br>
+        Use <strong>Washer 1</strong> for address <strong class="mono">dc:da:0c:d6:e0:96</strong><br>
+        Use <strong>Dryer 4</strong> for address <strong class="mono">30:30:f9:fe:4c:16</strong>
+      </div>
+
       <p class="small" id="envNote"></p>
     </div>
 
@@ -65,7 +63,6 @@
         <button id="dryer15Btn" disabled>Dryer 4 - 15 min cycle</button>
         <button id="dryerFullBtn" disabled>Dryer 4 - Full dry</button>
       </div>
-      <p class="small">These run the same command sequence as your Python script.</p>
     </div>
 
     <div class="card">
@@ -79,7 +76,7 @@
     const RX_UUID = "569a2000-b87f-490c-92cb-11ba5ea5167c"; // notify: device -> host
     const TX_UUID = "569a2001-b87f-490c-92cb-11ba5ea5167c"; // write: host -> device
 
-    // Native-script reference addresses (display/mapping only)
+    // Reference addresses
     const DRYER4_ADDRESS = "30:30:f9:fe:4c:16";
     const WASHER1_ADDRESS = "dc:da:0c:d6:e0:96";
 
@@ -339,7 +336,6 @@
               { namePrefix: "Washer" },
               { namePrefix: "Dryer" }
             ],
-            // NOTE: Some devices need their primary service UUID here.
             optionalServices: [RX_UUID, TX_UUID]
           });
         }
@@ -424,8 +420,8 @@
 
     // Init
     setConnectedUi(false);
-    log(`Reference mapping: Washer 1 = ${WASHER1_ADDRESS}`);
-    log(`Reference mapping: Dryer 4 = ${DRYER4_ADDRESS}`);
+    log(`Use Washer 1 for address ${WASHER1_ADDRESS}`);
+    log(`Use Dryer 4 for address ${DRYER4_ADDRESS}`);
 
     // Environment hint
     const ua = navigator.userAgent || "";
