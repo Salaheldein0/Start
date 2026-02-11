@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Laundry Cycle Starter (Web Bluetooth)</title>
+  <style>
+    :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    body { margin: 0; background: #0f172a; color: #e2e8f0; }
+    .wrap { max-width: 760px; margin: 0 auto; padding: 20px; }
+    h1 { font-size: 1.2rem; margin: 0 0 8px; }
+    p { margin: 6px 0 14px; color: #cbd5e1; }
+    .card { background: #111827; border: 1px solid #334155; border-radius: 14px; padding: 14px; margin: 12px 0; }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; }
+    button {
+      border: 1px solid #475569; background: #1e293b; color: #e2e8f0;
+      padding: 10px 12px; border-radius: 10px; font-size: 0.95rem; cursor: pointer;
+    }
+    button:hover { background: #273449; }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    .ok { color: #22c55e; }
+    .bad { color: #ef4444; }
+    .warn { color: #f59e0b; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    #log {
+      white-space: pre-wrap; background: #020617; border: 1px solid #334155;
+      padding: 12px; border-radius: 10px; max-height: 320px; overflow: auto;
+    }
+    .small { font-size: 0.85rem; color: #94a3b8; }
+    .pill { display: inline-block; border: 1px solid #475569; border-radius: 999px; padding: 2px 8px; margin-left: 6px; font-size: 12px; color: #93c5fd; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Laundry Cycle Starter <span class="pill">Web Bluetooth</span></h1>
+    <p>Make sure you are in the laundry room and Bluetooth is enabled.</p>
+
+    <div class="card">
+      <div class="row">
+        <button id="connectBtn">Connect Device</button>
+        <button id="disconnectBtn" disabled>Disconnect</button>
+      </div>
+      <p class="small" id="status">Status: not connected</p>
+      <p class="small mono">RX UUID: 569a2000-b87f-490c-92cb-11ba5ea5167c<br>TX UUID: 569a2001-b87f-490c-92cb-11ba5ea5167c</p>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <button id="washerBtn" disabled>Washer 1 - Full wash</button>
+        <button id="dryer15Btn" disabled>Dryer 4 - 15 min cycle</button>
+        <button id="dryerFullBtn" disabled>Dryer 4 - Full dry</button>
+      </div>
+      <p class="small">These run the same command sequence as your Python script.</p>
+    </div>
+
+    <div class="card">
+      <strong>Log</strong>
+      <div id="log" class="mono"></div>
+    </div>
+  </div>
+
+  <script>
+    // ===== Constants from your Python app =====
+    const RX_UUID = "569a2000-b87f-490c-92cb-11ba5ea5167c"; // notify device->host
+    const TX_UUID = "569a2001-b87f-490c-92cb-11ba5ea5167c"; // write host->device
+
+    const CMD = {
+      HANDSHAKE: "[HANDSHAKE:ENABLE]",
+      VERSION: "[VERSION]",
+      COIN_DISABLE: "[COIN:DISABLE:OCCUPIED_LOW]",
+      EXEC: "[EXEC]",
+      ACTIVATE_WASHER_FULL: "[ACTIVATE:01:PULSE:OCCUPIED_LOW:00000000:00000032:00000032:0003:GZS979139]",
+      ACTIVATE_DRYER_FULL:  "[ACTIVATE:01:PULSE:OCCUPIED_LOW:00000000:00000032:00000032:0004:CJS795938]",
+      ACTIVATE_DRYER_15:    "[ACTIVATE:01:PULSE:OCCUPIED_LOW:00000000:00000032:00:0001:CJS795938]"
+    };
+
+    // ===== State =====
+    let device = null;
+    let server = null;
+    let service = null;
+    let rxChar = null;
+    let txChar = null;
+
+    let rxBuf = new Uint8Array(0);
+    const messageQueue = [];
+    let waiters = [];
+
+    const enc = new TextEncoder();
+    const dec = new TextDecoder("utf-8", { fatal: false });
+
+    // ===== UI =====
+    const els = {
+      connectBtn: document.getElementById("connectBtn"),
+      disconnectBtn: document.getElementById("disconnectBtn"),
+      washerBtn: document.getElementById("washerBtn"),
+      dryer15Btn: document.getElementById("dryer15Btn"),
+      dryerFullBtn: document.getElementById("dryerFullBtn"),
+      status: document.getElementById("status"),
+      log: document.getElementById("log"),
+    };
+
+    function log(line, cls = "") {
+      const ts = new Date().toLocaleTimeString();
+      const prefix = `[${ts}] `;
+      const text = prefix + line + "\n";
+      if (cls) {
+        const span = document.createElement("span");
+        span.className = cls;
+        span.textContent = text;
+        els.log.appendChild(span);
+      } else {
+        els.log.appendChild(document.createTextNode(text));
+      }
+      els.log.scrollTop = els.log.scrollHeight;
+      console.log(line);
+    }
+
+    function setStatus(text, cls = "") {
+      els.status.className = "small " + cls;
+      els.status.textContent = "Status: " + text;
+    }
+
+    function setConnectedUi(connected) {
+      els.connectBtn.disabled = connected;
+      els.disconnectBtn.disabled = !connected;
+      els.washerBtn.disabled = !connected;
+      els.dryer15Btn.disabled = !connected;
+      els.dryerFullBtn.disabled = !connected;
+    }
+
+    function resetRx() {
+      rxBuf = new Uint8Array(0);
+      messageQueue.length = 0;
+      waiters = [];
+    }
+
+    function concatUint8(a, b) {
+      const out = new Uint8Array(a.length + b.length);
+      out.set(a, 0);
+      out.set(b, a.length);
+      return out;
+    }
+
+    // Extract frames like [....] from rxBuf
+    function extractFramesFromBuffer() {
+      const frames = [];
+      while (true) {
+        let start = rxBuf.indexOf("[".charCodeAt(0));
+        if (start < 0) {
+          rxBuf = new Uint8Array(0);
+          return frames;
+        }
+        if (start > 0) {
+          rxBuf = rxBuf.slice(start);
+        }
+        let end = rxBuf.indexOf("]".charCodeAt(0), 1);
+        if (end < 0) return frames;
+
+        const frame = rxBuf.slice(0, end + 1);
+        frames.push(frame);
+        rxBuf = rxBuf.slice(end + 1);
+      }
+    }
+
+    function onNotify(event) {
+      try {
+        const v = event.target.value; // DataView
+        const chunk = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+        rxBuf = concatUint8(rxBuf, chunk);
+
+        for (const raw of extractFramesFromBuffer()) {
+          const msg = dec.decode(raw);
+          log(`RX: ${msg}`);
+          enqueueMessage(msg);
+        }
+      } catch (e) {
+        log(`[WARN] Notify parse error: ${String(e)}`, "warn");
+      }
+    }
+
+    function enqueueMessage(msg) {
+      messageQueue.push(msg);
+      resolveWaiters();
+    }
+
+    function resolveWaiters() {
+      if (!waiters.length || !messageQueue.length) return;
+      for (let i = 0; i < waiters.length; i++) {
+        const w = waiters[i];
+        const idx = messageQueue.findIndex(m => m.startsWith(w.prefix));
+        if (idx >= 0) {
+          const [msg] = messageQueue.splice(idx, 1);
+          clearTimeout(w.timer);
+          w.resolve(msg);
+          waiters.splice(i, 1);
+          i--;
+        }
+      }
+    }
+
+    function waitForPrefix(prefix, timeoutMs = 5000) {
+      const immediateIdx = messageQueue.findIndex(m => m.startsWith(prefix));
+      if (immediateIdx >= 0) {
+        const [msg] = messageQueue.splice(immediateIdx, 1);
+        return Promise.resolve(msg);
+      }
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          const idx = waiters.findIndex(w => w.resolve === resolve);
+          if (idx >= 0) waiters.splice(idx, 1);
+          reject(new Error(`Timeout waiting for ${prefix}`));
+        }, timeoutMs);
+
+        waiters.push({ prefix, resolve, reject, timer });
+      });
+    }
+
+    async function send(text, expectPrefix = null, timeoutMs = 5000) {
+      if (!txChar) throw new Error("Not connected");
+      log(`TX: ${text}`);
+      const bytes = enc.encode(text);
+      await txChar.writeValueWithoutResponse(bytes);
+      if (expectPrefix) {
+        return await waitForPrefix(expectPrefix, timeoutMs);
+      }
+      return "";
+    }
+
+    async function runSequence(activateCmd) {
+      try {
+        await send(CMD.HANDSHAKE, "[ACK:HANDSHAKE]", 8000);
+        await send(CMD.VERSION, "[VERSION:", 8000);
+        await send(CMD.COIN_DISABLE, "[ACK:COIN]", 8000);
+        await send(activateCmd, "[ACK:ACTIVATE]", 8000);
+        await send(CMD.EXEC, "[ACK:EXEC]", 8000);
+        await new Promise(r => setTimeout(r, 500));
+        log("Result: SUCCESS", "ok");
+        return true;
+      } catch (e) {
+        log(`[ERROR] ${String(e)}`, "bad");
+        log("Result: FAILED", "bad");
+        return false;
+      }
+    }
+
+    async function connect() {
+      if (!navigator.bluetooth) {
+        log("[ERROR] Web Bluetooth not supported in this browser.", "bad");
+        setStatus("Web Bluetooth unsupported", "bad");
+        return;
+      }
+
+      try {
+        setStatus("requesting device...");
+        resetRx();
+
+        // Option A: filter by service UUID (preferred if known as primary service)
+        // Option B: allow all devices and request optional services.
+        device = await navigator.bluetooth.requestDevice({
+          // If your machines advertise a known name, you can add:
+          // filters: [{ namePrefix: "DRYER" }, { namePrefix: "WASHER" }],
+          acceptAllDevices: true,
+          optionalServices: [RX_UUID, TX_UUID]
+        });
+
+        device.addEventListener("gattserverdisconnected", onDisconnected);
+
+        server = await device.gatt.connect();
+
+        // Try to obtain characteristics by scanning services
+        const services = await server.getPrimaryServices();
+        let foundRx = null, foundTx = null;
+
+        for (const s of services) {
+          const chars = await s.getCharacteristics();
+          for (const c of chars) {
+            const u = c.uuid.toLowerCase();
+            if (u === RX_UUID.toLowerCase()) foundRx = c;
+            if (u === TX_UUID.toLowerCase()) foundTx = c;
+          }
+        }
+
+        if (!foundRx || !foundTx) {
+          throw new Error("Could not find RX/TX characteristics on device.");
+        }
+
+        rxChar = foundRx;
+        txChar = foundTx;
+
+        await rxChar.startNotifications();
+        rxChar.addEventListener("characteristicvaluechanged", onNotify);
+
+        setConnectedUi(true);
+        setStatus(`connected to ${device.name || "(unnamed device)"}`, "ok");
+        log(`[INFO] Connected to ${device.name || "device"}`, "ok");
+      } catch (e) {
+        log(`[ERROR] Connect failed: ${String(e)}`, "bad");
+        setStatus("connect failed", "bad");
+        await disconnect();
+      }
+    }
+
+    async function disconnect() {
+      try {
+        if (rxChar) {
+          try {
+            rxChar.removeEventListener("characteristicvaluechanged", onNotify);
+            await rxChar.stopNotifications();
+          } catch {}
+        }
+        if (device && device.gatt && device.gatt.connected) {
+          device.gatt.disconnect();
+        }
+      } finally {
+        device = null; server = null; service = null; rxChar = null; txChar = null;
+        resetRx();
+        setConnectedUi(false);
+        setStatus("not connected");
+        log("[INFO] Disconnected.");
+      }
+    }
+
+    function onDisconnected() {
+      log("[WARN] Device disconnected.", "warn");
+      setConnectedUi(false);
+      setStatus("disconnected", "warn");
+      device = null; server = null; service = null; rxChar = null; txChar = null;
+      resetRx();
+    }
+
+    // ===== Wire UI =====
+    els.connectBtn.addEventListener("click", connect);
+    els.disconnectBtn.addEventListener("click", disconnect);
+
+    els.washerBtn.addEventListener("click", async () => {
+      log("Starting Washer 1: Full wash...");
+      await runSequence(CMD.ACTIVATE_WASHER_FULL);
+    });
+
+    els.dryer15Btn.addEventListener("click", async () => {
+      log("Starting Dryer 4: 15 min cycle...");
+      await runSequence(CMD.ACTIVATE_DRYER_15);
+    });
+
+    els.dryerFullBtn.addEventListener("click", async () => {
+      log("Starting Dryer 4: Full dry cycle...");
+      await runSequence(CMD.ACTIVATE_DRYER_FULL);
+    });
+
+    setConnectedUi(false);
+  </script>
+</body>
+</html>
