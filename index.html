@@ -72,11 +72,9 @@
   </div>
 
   <script>
-    // ===== Constants from your Python app =====
-    const RX_UUID = "569a2000-b87f-490c-92cb-11ba5ea5167c"; // notify: device -> host
-    const TX_UUID = "569a2001-b87f-490c-92cb-11ba5ea5167c"; // write: host -> device
+    const RX_UUID = "569a2000-b87f-490c-92cb-11ba5ea5167c";
+    const TX_UUID = "569a2001-b87f-490c-92cb-11ba5ea5167c";
 
-    // Reference addresses
     const DRYER4_ADDRESS = "30:30:f9:fe:4c:16";
     const WASHER1_ADDRESS = "dc:da:0c:d6:e0:96";
 
@@ -90,20 +88,13 @@
       ACTIVATE_DRYER_15:    "[ACTIVATE:01:PULSE:OCCUPIED_LOW:00000000:00000032:00:0001:CJS795938]"
     };
 
-    // ===== State =====
-    let device = null;
-    let server = null;
-    let rxChar = null;
-    let txChar = null;
-
+    let device = null, server = null, rxChar = null, txChar = null;
     let rxBuf = new Uint8Array(0);
     const messageQueue = [];
     let waiters = [];
-
     const enc = new TextEncoder();
     const dec = new TextDecoder("utf-8", { fatal: false });
 
-    // ===== UI =====
     const els = {
       connectBtn: document.getElementById("connectBtn"),
       disconnectBtn: document.getElementById("disconnectBtn"),
@@ -152,23 +143,16 @@
 
     function concatUint8(a, b) {
       const out = new Uint8Array(a.length + b.length);
-      out.set(a, 0);
-      out.set(b, a.length);
+      out.set(a, 0); out.set(b, a.length);
       return out;
     }
 
-    // Extract frames like [....] from rxBuf
     function extractFramesFromBuffer() {
       const frames = [];
       while (true) {
         const start = rxBuf.indexOf("[".charCodeAt(0));
-        if (start < 0) {
-          rxBuf = new Uint8Array(0);
-          return frames;
-        }
-        if (start > 0) {
-          rxBuf = rxBuf.slice(start);
-        }
+        if (start < 0) { rxBuf = new Uint8Array(0); return frames; }
+        if (start > 0) rxBuf = rxBuf.slice(start);
 
         const end = rxBuf.indexOf("]".charCodeAt(0), 1);
         if (end < 0) return frames;
@@ -180,10 +164,9 @@
 
     function onNotify(event) {
       try {
-        const v = event.target.value; // DataView
+        const v = event.target.value;
         const chunk = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
         rxBuf = concatUint8(rxBuf, chunk);
-
         for (const raw of extractFramesFromBuffer()) {
           const msg = dec.decode(raw);
           log(`RX: ${msg}`);
@@ -194,14 +177,10 @@
       }
     }
 
-    function enqueueMessage(msg) {
-      messageQueue.push(msg);
-      resolveWaiters();
-    }
+    function enqueueMessage(msg) { messageQueue.push(msg); resolveWaiters(); }
 
     function resolveWaiters() {
       if (!waiters.length || !messageQueue.length) return;
-
       for (let i = 0; i < waiters.length; i++) {
         const w = waiters[i];
         const idx = messageQueue.findIndex(m => m.startsWith(w.prefix));
@@ -221,30 +200,21 @@
         const [msg] = messageQueue.splice(immediateIdx, 1);
         return Promise.resolve(msg);
       }
-
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
           const idx = waiters.findIndex(w => w.resolve === resolve);
           if (idx >= 0) waiters.splice(idx, 1);
           reject(new Error(`Timed out waiting for ${prefix}`));
         }, timeoutMs);
-
         waiters.push({ prefix, resolve, reject, timer });
       });
     }
 
     async function send(text, expectPrefix = null, timeoutMs = 5000) {
       if (!txChar) throw new Error("Not connected");
-
       log(`TX: ${text}`);
-      const bytes = enc.encode(text);
-
-      // Equivalent to bleak response=False
-      await txChar.writeValueWithoutResponse(bytes);
-
-      if (expectPrefix) {
-        return await waitForPrefix(expectPrefix, timeoutMs);
-      }
+      await txChar.writeValueWithoutResponse(enc.encode(text));
+      if (expectPrefix) return await waitForPrefix(expectPrefix, timeoutMs);
       return "";
     }
 
@@ -256,7 +226,6 @@
         await send(activateCmd, "[ACK:ACTIVATE]", 8000);
         await send(CMD.EXEC, "[ACK:EXEC]", 8000);
         await new Promise(r => setTimeout(r, 500));
-
         log("Result: SUCCESS", "ok");
         return true;
       } catch (e) {
@@ -268,8 +237,7 @@
 
     async function findRxTxCharacteristics(gattServer) {
       const services = await gattServer.getPrimaryServices();
-      let foundRx = null;
-      let foundTx = null;
+      let foundRx = null, foundTx = null;
 
       for (const s of services) {
         const chars = await s.getCharacteristics();
@@ -279,10 +247,23 @@
           if (u === TX_UUID.toLowerCase()) foundTx = c;
         }
       }
+
       if (!foundRx || !foundTx) {
-        throw new Error("Could not find RX/TX characteristics on device.");
+        throw new Error(
+          "Connected, but RX/TX characteristics were not found. " +
+          "This may be the wrong device or required service permission is missing."
+        );
       }
       return { foundRx, foundTx };
+    }
+
+    async function requestDeviceFallbackChooser() {
+      // IMPORTANT: acceptAllDevices avoids "No compatible devices" when names/services don't match filters.
+      return await navigator.bluetooth.requestDevice({
+        acceptAllDevices: true
+        // If you later learn the correct *service* UUID, add:
+        // optionalServices: ["YOUR_PRIMARY_SERVICE_UUID"]
+      });
     }
 
     async function connect() {
@@ -291,7 +272,6 @@
         setStatus("requires HTTPS/localhost", "bad");
         return;
       }
-
       if (!navigator.bluetooth) {
         log("[ERROR] Web Bluetooth not supported in this browser.", "bad");
         setStatus("Web Bluetooth unsupported", "bad");
@@ -304,7 +284,7 @@
 
         let chosenDevice = null;
 
-        // Optional API (not in all browsers/versions)
+        // Optional API: may not exist in some browser versions.
         if (typeof navigator.bluetooth.getDevices === "function") {
           try {
             const granted = await navigator.bluetooth.getDevices();
@@ -314,11 +294,8 @@
                 return n.includes("washer") || n.includes("dryer") || n.includes("laundry");
               }) || granted[0] || null;
 
-            if (chosenDevice) {
-              log(`[INFO] Reusing granted device: ${chosenDevice.name || "(unnamed)"}`);
-            } else {
-              log("[INFO] No previously granted devices found; opening chooser.");
-            }
+            if (chosenDevice) log(`[INFO] Reusing granted device: ${chosenDevice.name || "(unnamed)"}`);
+            else log("[INFO] No previously granted devices found; opening chooser.");
           } catch (e) {
             log(`[WARN] getDevices failed, falling back to chooser: ${String(e)}`, "warn");
           }
@@ -326,19 +303,7 @@
           log("[INFO] getDevices() not supported in this browser; opening chooser.");
         }
 
-        // First time / fallback path
-        if (!chosenDevice) {
-          chosenDevice = await navigator.bluetooth.requestDevice({
-            filters: [
-              { namePrefix: "WASHER" },
-              { namePrefix: "DRYER" },
-              { namePrefix: "Laundry" },
-              { namePrefix: "Washer" },
-              { namePrefix: "Dryer" }
-            ],
-            optionalServices: [RX_UUID, TX_UUID]
-          });
-        }
+        if (!chosenDevice) chosenDevice = await requestDeviceFallbackChooser();
 
         device = chosenDevice;
         device.addEventListener("gattserverdisconnected", onDisconnected);
@@ -356,7 +321,12 @@
         setStatus(`connected to ${device.name || "(unnamed device)"}`, "ok");
         log(`[INFO] Connected to ${device.name || "device"}`, "ok");
       } catch (e) {
-        log(`[ERROR] Connect failed: ${String(e)}`, "bad");
+        // User cancels chooser -> NotFoundError is normal.
+        if (String(e).includes("NotFoundError")) {
+          log("[WARN] No device selected in chooser.", "warn");
+        } else {
+          log(`[ERROR] Connect failed: ${String(e)}`, "bad");
+        }
         setStatus("connect failed", "bad");
         await disconnect();
       }
@@ -372,15 +342,11 @@
             log(`[WARN] Failed to stop notifications cleanly: ${String(e)}`, "warn");
           }
         }
-
         if (device && device.gatt && device.gatt.connected) {
           device.gatt.disconnect();
         }
       } finally {
-        device = null;
-        server = null;
-        rxChar = null;
-        txChar = null;
+        device = null; server = null; rxChar = null; txChar = null;
         resetRx();
         setConnectedUi(false);
         setStatus("not connected");
@@ -390,44 +356,35 @@
 
     function onDisconnected() {
       log("[WARN] Device disconnected.", "warn");
-      device = null;
-      server = null;
-      rxChar = null;
-      txChar = null;
+      device = null; server = null; rxChar = null; txChar = null;
       resetRx();
       setConnectedUi(false);
       setStatus("disconnected", "warn");
     }
 
-    // ===== UI events =====
     els.connectBtn.addEventListener("click", connect);
     els.disconnectBtn.addEventListener("click", disconnect);
-
     els.washerBtn.addEventListener("click", async () => {
       log("Starting Washer 1: Full wash...");
       await runSequence(CMD.ACTIVATE_WASHER_FULL);
     });
-
     els.dryer15Btn.addEventListener("click", async () => {
       log("Starting Dryer 4: 15 min cycle...");
       await runSequence(CMD.ACTIVATE_DRYER_15);
     });
-
     els.dryerFullBtn.addEventListener("click", async () => {
       log("Starting Dryer 4: Full dry cycle...");
       await runSequence(CMD.ACTIVATE_DRYER_FULL);
     });
 
-    // Init
     setConnectedUi(false);
     log(`Use Washer 1 for address ${WASHER1_ADDRESS}`);
     log(`Use Dryer 4 for address ${DRYER4_ADDRESS}`);
 
-    // Environment hint
     const ua = navigator.userAgent || "";
     const isFirefox = ua.toLowerCase().includes("firefox");
     if (isFirefox) {
-      els.envNote.textContent = "You appear to be on Firefox. Web Bluetooth is typically unavailable there; use Chrome/Edge.";
+      els.envNote.textContent = "You appear to be on Firefox. Use Chrome/Edge for Web Bluetooth.";
       log("[WARN] Firefox detected. Use Chrome/Edge for Web Bluetooth.", "warn");
     } else if (!window.isSecureContext) {
       els.envNote.textContent = "This page must be served over HTTPS (or localhost) for Web Bluetooth.";
