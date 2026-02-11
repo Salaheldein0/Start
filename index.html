@@ -24,11 +24,12 @@
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
     #log {
       white-space: pre-wrap; background: #020617; border: 1px solid #334155;
-      padding: 12px; border-radius: 10px; max-height: 320px; overflow: auto;
+      padding: 12px; border-radius: 10px; max-height: 340px; overflow: auto;
     }
     .small { font-size: 0.85rem; color: #94a3b8; }
     .pill { display: inline-block; border: 1px solid #475569; border-radius: 999px; padding: 2px 8px; margin-left: 6px; font-size: 12px; color: #93c5fd; }
     .map { margin-top: 8px; padding: 10px; border: 1px dashed #475569; border-radius: 10px; background: #0b1220; }
+    .stage { margin-top: 8px; padding: 8px 10px; border-radius: 8px; background: #0b1220; border: 1px solid #334155; }
   </style>
 </head>
 <body>
@@ -54,6 +55,7 @@
         Use <strong>Dryer 4</strong> for address <strong class="mono">30:30:f9:fe:4c:16</strong>
       </div>
 
+      <div class="stage small" id="stage">Connection stage: idle</div>
       <p class="small" id="envNote"></p>
     </div>
 
@@ -75,6 +77,9 @@
     // ===== Constants =====
     const RX_UUID = "569a2000-b87f-490c-92cb-11ba5ea5167c";
     const TX_UUID = "569a2001-b87f-490c-92cb-11ba5ea5167c";
+
+    // Browser service permissions list.
+    // NOTE: optionalServices expects service UUIDs. These are your known UUIDs from current setup.
     const OPTIONAL_SERVICE_UUIDS = [RX_UUID, TX_UUID];
 
     const DRYER4_ADDRESS = "30:30:f9:fe:4c:16";
@@ -91,7 +96,11 @@
     };
 
     // ===== State =====
-    let device = null, server = null, rxChar = null, txChar = null;
+    let device = null;
+    let server = null;
+    let rxChar = null;
+    let txChar = null;
+
     let rxBuf = new Uint8Array(0);
     const messageQueue = [];
     let waiters = [];
@@ -109,7 +118,12 @@
       status: document.getElementById("status"),
       log: document.getElementById("log"),
       envNote: document.getElementById("envNote"),
+      stage: document.getElementById("stage"),
     };
+
+    function setStage(text) {
+      els.stage.textContent = `Connection stage: ${text}`;
+    }
 
     function log(line, cls = "") {
       const ts = new Date().toLocaleTimeString();
@@ -157,7 +171,10 @@
       const frames = [];
       while (true) {
         const start = rxBuf.indexOf("[".charCodeAt(0));
-        if (start < 0) { rxBuf = new Uint8Array(0); return frames; }
+        if (start < 0) {
+          rxBuf = new Uint8Array(0);
+          return frames;
+        }
         if (start > 0) rxBuf = rxBuf.slice(start);
 
         const end = rxBuf.indexOf("]".charCodeAt(0), 1);
@@ -168,6 +185,22 @@
       }
     }
 
+    function onNotify(event) {
+      try {
+        const v = event.target.value;
+        const chunk = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+        rxBuf = concatUint8(rxBuf, chunk);
+
+        for (const raw of extractFramesFromBuffer()) {
+          const msg = dec.decode(raw);
+          log(`RX: ${msg}`);
+          enqueueMessage(msg);
+        }
+      } catch (e) {
+        log(`[WARN] Notify parse error: ${String(e)}`, "warn");
+      }
+    }
+
     function enqueueMessage(msg) {
       messageQueue.push(msg);
       resolveWaiters();
@@ -175,6 +208,7 @@
 
     function resolveWaiters() {
       if (!waiters.length || !messageQueue.length) return;
+
       for (let i = 0; i < waiters.length; i++) {
         const w = waiters[i];
         const idx = messageQueue.findIndex(m => m.startsWith(w.prefix));
@@ -194,39 +228,29 @@
         const [msg] = messageQueue.splice(immediateIdx, 1);
         return Promise.resolve(msg);
       }
+
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
           const idx = waiters.findIndex(w => w.resolve === resolve);
           if (idx >= 0) waiters.splice(idx, 1);
           reject(new Error(`Timed out waiting for ${prefix}`));
         }, timeoutMs);
+
         waiters.push({ prefix, resolve, reject, timer });
       });
     }
 
-    function onNotify(event) {
-      try {
-        const v = event.target.value;
-        const chunk = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
-        rxBuf = concatUint8(rxBuf, chunk);
-        for (const raw of extractFramesFromBuffer()) {
-          const msg = dec.decode(raw);
-          log(`RX: ${msg}`);
-          enqueueMessage(msg);
-        }
-      } catch (e) {
-        log(`[WARN] Notify parse error: ${String(e)}`, "warn");
-      }
-    }
-
     async function send(text, expectPrefix = null, timeoutMs = 5000) {
-      if (!txChar) throw new Error("Not connected");
+      if (!txChar) throw new Error("Not connected (TX missing)");
+
       log(`TX: ${text}`);
       const bytes = enc.encode(text);
 
+      // Prefer no-response (your bleak behavior), fallback to with-response
       try {
         await txChar.writeValueWithoutResponse(bytes);
-      } catch {
+      } catch (e) {
+        log("[WARN] writeValueWithoutResponse failed, retrying writeValue...", "warn");
         await txChar.writeValue(bytes);
       }
 
@@ -249,28 +273,25 @@
       }
     }
 
+    // TX is required; RX is optional (for notify)
     async function findRxTxCharacteristics(gattServer) {
       const rx = RX_UUID.toLowerCase();
       const tx = TX_UUID.toLowerCase();
 
-      // Try direct by primary service first
-      try {
-        const svc = await gattServer.getPrimaryService(RX_UUID);
-        const chars = await svc.getCharacteristics();
-        let foundRx = null, foundTx = null;
-        for (const c of chars) {
-          const u = c.uuid.toLowerCase();
-          if (u === rx) foundRx = c;
-          if (u === tx) foundTx = c;
-        }
-        if (foundRx && foundTx) return { foundRx, foundTx };
-      } catch (_) {}
-
-      // Fallback: scan all granted primary services
       const services = await gattServer.getPrimaryServices();
+      log(`[INFO] Found ${services.length} primary service(s).`);
+
       let foundRx = null, foundTx = null;
+
       for (const s of services) {
-        const chars = await s.getCharacteristics();
+        let chars = [];
+        try {
+          chars = await s.getCharacteristics();
+        } catch (e) {
+          log(`[WARN] Could not read characteristics for service ${s.uuid}: ${String(e)}`, "warn");
+          continue;
+        }
+
         for (const c of chars) {
           const u = c.uuid.toLowerCase();
           if (u === rx) foundRx = c;
@@ -278,66 +299,107 @@
         }
       }
 
-      if (!foundRx || !foundTx) {
-        throw new Error("Connected, but RX/TX characteristics were not found. You may need the device's primary service UUID in optionalServices.");
+      if (!foundTx) {
+        throw new Error(
+          "TX characteristic not found. Wrong device or missing service permission (optionalServices)."
+        );
       }
+
       return { foundRx, foundTx };
     }
 
     async function connect() {
       log("[INFO] Connect clicked...");
+      setStage("start");
+
       if (!window.isSecureContext) {
         log("[ERROR] Web Bluetooth requires HTTPS or localhost.", "bad");
         setStatus("requires HTTPS/localhost", "bad");
+        setStage("blocked: insecure context");
         return;
       }
+
       if (!navigator.bluetooth) {
         log("[ERROR] Web Bluetooth not supported in this browser.", "bad");
         setStatus("Web Bluetooth unsupported", "bad");
+        setStage("blocked: unsupported browser");
         return;
       }
 
+      // prevent rapid double-click race
+      els.connectBtn.disabled = true;
+
       try {
         setStatus("opening chooser...");
+        setStage("chooser");
         resetRx();
 
-        // IMPORTANT: requestDevice is called directly in click flow
         const chosenDevice = await navigator.bluetooth.requestDevice({
           acceptAllDevices: true,
           optionalServices: OPTIONAL_SERVICE_UUIDS
         });
 
+        log(`[INFO] Chooser returned: ${chosenDevice.name || "(unnamed)"} (${chosenDevice.id || "no-id"})`);
         device = chosenDevice;
         device.addEventListener("gattserverdisconnected", onDisconnected);
 
-        setStatus("connecting...");
+        setStatus("connecting GATT...");
+        setStage("gatt connect");
         server = await device.gatt.connect();
+        log("[INFO] GATT connected.", "ok");
 
+        setStatus("discovering characteristics...");
+        setStage("characteristic discovery");
         const { foundRx, foundTx } = await findRxTxCharacteristics(server);
         rxChar = foundRx;
         txChar = foundTx;
 
-        await rxChar.startNotifications();
-        rxChar.addEventListener("characteristicvaluechanged", onNotify);
-
+        // Enable buttons as soon as TX is ready
         setConnectedUi(true);
         setStatus(`connected to ${device.name || "(unnamed device)"}`, "ok");
-        log(`[INFO] Connected to ${device.name || "device"}`, "ok");
+        setStage("connected");
+        log("[INFO] TX found. Controls enabled.", "ok");
+
+        // Notifications are optional
+        if (rxChar) {
+          try {
+            await rxChar.startNotifications();
+            rxChar.addEventListener("characteristicvaluechanged", onNotify);
+            log("[INFO] RX notifications started.", "ok");
+          } catch (e) {
+            log(`[WARN] RX exists but notifications failed: ${String(e)}`, "warn");
+          }
+        } else {
+          log("[WARN] RX characteristic not found; continuing without notifications.", "warn");
+        }
 
         if ((device.name || "") === WASHER1_ADV_NAME) {
           log("[INFO] Selected device matches Washer 1 (AWYDLOOBYZR1).", "ok");
         } else {
           log("[INFO] If this is Dryer 4, continue. If not, disconnect and choose again.", "warn");
         }
+
       } catch (e) {
-        const msg = String(e);
-        if (msg.includes("NotFoundError")) {
-          log("[WARN] No device selected in chooser.", "warn");
-        } else {
-          log(`[ERROR] Connect failed: ${msg}`, "bad");
-        }
+        const msg = `${e?.name || "Error"}: ${e?.message || String(e)}`;
+        log(`[ERROR] Connect failed: ${msg}`, "bad");
         setStatus("connect failed", "bad");
+
+        if (e?.name === "NotFoundError") {
+          log("[HINT] Chooser closed without returning a device. Click a device then Pair/Connect.", "warn");
+          setStage("chooser cancelled/no device");
+        } else if (e?.name === "SecurityError") {
+          log("[HINT] Need correct service UUID(s) in optionalServices for this device.", "warn");
+          setStage("security error");
+        } else {
+          setStage("failed");
+        }
+
         await disconnect();
+      } finally {
+        // If not connected, re-enable connect button
+        if (!device || !device.gatt || !device.gatt.connected) {
+          els.connectBtn.disabled = false;
+        }
       }
     }
 
@@ -351,7 +413,8 @@
             log(`[WARN] stopNotifications issue: ${String(e)}`, "warn");
           }
         }
-        if (device?.gatt?.connected) {
+
+        if (device && device.gatt && device.gatt.connected) {
           device.gatt.disconnect();
         }
       } finally {
@@ -362,27 +425,26 @@
         resetRx();
         setConnectedUi(false);
         setStatus("not connected");
+        setStage("idle");
         log("[INFO] Disconnected.");
       }
     }
 
     function onDisconnected() {
       log("[WARN] Device disconnected.", "warn");
-      device = null; server = null; rxChar = null; txChar = null;
+      device = null;
+      server = null;
+      rxChar = null;
+      txChar = null;
       resetRx();
       setConnectedUi(false);
       setStatus("disconnected", "warn");
+      setStage("disconnected");
+      els.connectBtn.disabled = false;
     }
 
-    // Wire buttons
-    els.connectBtn.addEventListener("click", async () => {
-      els.connectBtn.disabled = true;
-      try { await connect(); }
-      finally {
-        if (!device) els.connectBtn.disabled = false;
-      }
-    });
-
+    // ===== UI events =====
+    els.connectBtn.addEventListener("click", connect);
     els.disconnectBtn.addEventListener("click", disconnect);
 
     els.washerBtn.addEventListener("click", async () => {
@@ -402,6 +464,7 @@
 
     // Init
     setConnectedUi(false);
+    setStage("idle");
     log(`Use Washer 1 (${WASHER1_ADV_NAME})`);
     log(`Use Dryer 4 for address ${DRYER4_ADDRESS}`);
 
@@ -417,7 +480,7 @@
       els.envNote.textContent = "";
     }
 
-    // Capture uncaught errors into log so "does nothing" is diagnosable
+    // Extra diagnostics to avoid silent failures
     window.addEventListener("error", (e) => {
       log(`[ERROR] Uncaught: ${e.message}`, "bad");
     });
