@@ -41,7 +41,21 @@
         <button id="disconnectBtn" disabled>Disconnect</button>
       </div>
       <p class="small" id="status">Status: not connected</p>
-      <p class="small mono">RX UUID: 569a2000-b87f-490c-92cb-11ba5ea5167c<br>TX UUID: 569a2001-b87f-490c-92cb-11ba5ea5167c</p>
+
+      <p class="small mono">
+        RX UUID: 569a2000-b87f-490c-92cb-11ba5ea5167c<br>
+        TX UUID: 569a2001-b87f-490c-92cb-11ba5ea5167c
+      </p>
+
+      <p class="small mono">
+        Device addresses (from native script):<br>
+        • Washer 1: <strong>dc:da:0c:d6:e0:96</strong><br>
+        • Dryer 4: <strong>30:30:f9:fe:4c:16</strong>
+      </p>
+      <p class="small">
+        Note: Web Bluetooth may not expose/connect by MAC address directly in-browser;
+        these are reference mappings from your Python app.
+      </p>
     </div>
 
     <div class="card">
@@ -61,8 +75,12 @@
 
   <script>
     // ===== Constants from your Python app =====
-    const RX_UUID = "569a2000-b87f-490c-92cb-11ba5ea5167c"; // notify device->host
-    const TX_UUID = "569a2001-b87f-490c-92cb-11ba5ea5167c"; // write host->device
+    const RX_UUID = "569a2000-b87f-490c-92cb-11ba5ea5167c"; // notify: device -> host
+    const TX_UUID = "569a2001-b87f-490c-92cb-11ba5ea5167c"; // write: host -> device
+
+    // Native-script reference addresses (for display/mapping only)
+    const DRYER4_ADDRESS = "30:30:f9:fe:4c:16";
+    const WASHER1_ADDRESS = "dc:da:0c:d6:e0:96";
 
     const CMD = {
       HANDSHAKE: "[HANDSHAKE:ENABLE]",
@@ -77,7 +95,6 @@
     // ===== State =====
     let device = null;
     let server = null;
-    let service = null;
     let rxChar = null;
     let txChar = null;
 
@@ -101,8 +118,7 @@
 
     function log(line, cls = "") {
       const ts = new Date().toLocaleTimeString();
-      const prefix = `[${ts}] `;
-      const text = prefix + line + "\n";
+      const text = `[${ts}] ${line}\n`;
       if (cls) {
         const span = document.createElement("span");
         span.className = cls;
@@ -131,6 +147,7 @@
     function resetRx() {
       rxBuf = new Uint8Array(0);
       messageQueue.length = 0;
+      waiters.forEach(w => clearTimeout(w.timer));
       waiters = [];
     }
 
@@ -145,7 +162,7 @@
     function extractFramesFromBuffer() {
       const frames = [];
       while (true) {
-        let start = rxBuf.indexOf("[".charCodeAt(0));
+        const start = rxBuf.indexOf("[".charCodeAt(0));
         if (start < 0) {
           rxBuf = new Uint8Array(0);
           return frames;
@@ -153,11 +170,11 @@
         if (start > 0) {
           rxBuf = rxBuf.slice(start);
         }
-        let end = rxBuf.indexOf("]".charCodeAt(0), 1);
+
+        const end = rxBuf.indexOf("]".charCodeAt(0), 1);
         if (end < 0) return frames;
 
-        const frame = rxBuf.slice(0, end + 1);
-        frames.push(frame);
+        frames.push(rxBuf.slice(0, end + 1));
         rxBuf = rxBuf.slice(end + 1);
       }
     }
@@ -185,6 +202,7 @@
 
     function resolveWaiters() {
       if (!waiters.length || !messageQueue.length) return;
+
       for (let i = 0; i < waiters.length; i++) {
         const w = waiters[i];
         const idx = messageQueue.findIndex(m => m.startsWith(w.prefix));
@@ -204,11 +222,12 @@
         const [msg] = messageQueue.splice(immediateIdx, 1);
         return Promise.resolve(msg);
       }
+
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
           const idx = waiters.findIndex(w => w.resolve === resolve);
           if (idx >= 0) waiters.splice(idx, 1);
-          reject(new Error(`Timeout waiting for ${prefix}`));
+          reject(new Error(`Timed out waiting for ${prefix}`));
         }, timeoutMs);
 
         waiters.push({ prefix, resolve, reject, timer });
@@ -217,9 +236,13 @@
 
     async function send(text, expectPrefix = null, timeoutMs = 5000) {
       if (!txChar) throw new Error("Not connected");
+
       log(`TX: ${text}`);
       const bytes = enc.encode(text);
+
+      // Equivalent to bleak response=False
       await txChar.writeValueWithoutResponse(bytes);
+
       if (expectPrefix) {
         return await waitForPrefix(expectPrefix, timeoutMs);
       }
@@ -234,6 +257,7 @@
         await send(activateCmd, "[ACK:ACTIVATE]", 8000);
         await send(CMD.EXEC, "[ACK:EXEC]", 8000);
         await new Promise(r => setTimeout(r, 500));
+
         log("Result: SUCCESS", "ok");
         return true;
       } catch (e) {
@@ -241,6 +265,25 @@
         log("Result: FAILED", "bad");
         return false;
       }
+    }
+
+    async function findRxTxCharacteristics(gattServer) {
+      const services = await gattServer.getPrimaryServices();
+      let foundRx = null;
+      let foundTx = null;
+
+      for (const s of services) {
+        const chars = await s.getCharacteristics();
+        for (const c of chars) {
+          const u = c.uuid.toLowerCase();
+          if (u === RX_UUID.toLowerCase()) foundRx = c;
+          if (u === TX_UUID.toLowerCase()) foundTx = c;
+        }
+      }
+      if (!foundRx || !foundTx) {
+        throw new Error("Could not find RX/TX characteristics on device.");
+      }
+      return { foundRx, foundTx };
     }
 
     async function connect() {
@@ -251,38 +294,40 @@
       }
 
       try {
-        setStatus("requesting device...");
+        setStatus("connecting...");
         resetRx();
 
-        // Option A: filter by service UUID (preferred if known as primary service)
-        // Option B: allow all devices and request optional services.
-        device = await navigator.bluetooth.requestDevice({
-          // If your machines advertise a known name, you can add:
-          // filters: [{ namePrefix: "DRYER" }, { namePrefix: "WASHER" }],
-          acceptAllDevices: true,
-          optionalServices: [RX_UUID, TX_UUID]
-        });
+        // 1) Try previously granted devices (no chooser)
+        const granted = await navigator.bluetooth.getDevices();
+
+        // Prefer familiar names if available; fallback to first granted.
+        const preferred = granted.find(d => {
+          const n = (d.name || "").toLowerCase();
+          return n.includes("washer") || n.includes("dryer") || n.includes("laundry");
+        }) || granted[0];
+
+        if (preferred) {
+          device = preferred;
+          log(`[INFO] Reusing granted device: ${device.name || "(unnamed)"}`);
+        } else {
+          // 2) First time: chooser required
+          device = await navigator.bluetooth.requestDevice({
+            filters: [
+              { namePrefix: "WASHER" },
+              { namePrefix: "DRYER" },
+              { namePrefix: "Laundry" },
+              { namePrefix: "Washer" },
+              { namePrefix: "Dryer" }
+            ],
+            // You may need your actual primary service UUID here for some devices.
+            optionalServices: [RX_UUID, TX_UUID]
+          });
+        }
 
         device.addEventListener("gattserverdisconnected", onDisconnected);
 
         server = await device.gatt.connect();
-
-        // Try to obtain characteristics by scanning services
-        const services = await server.getPrimaryServices();
-        let foundRx = null, foundTx = null;
-
-        for (const s of services) {
-          const chars = await s.getCharacteristics();
-          for (const c of chars) {
-            const u = c.uuid.toLowerCase();
-            if (u === RX_UUID.toLowerCase()) foundRx = c;
-            if (u === TX_UUID.toLowerCase()) foundTx = c;
-          }
-        }
-
-        if (!foundRx || !foundTx) {
-          throw new Error("Could not find RX/TX characteristics on device.");
-        }
+        const { foundRx, foundTx } = await findRxTxCharacteristics(server);
 
         rxChar = foundRx;
         txChar = foundTx;
@@ -306,13 +351,19 @@
           try {
             rxChar.removeEventListener("characteristicvaluechanged", onNotify);
             await rxChar.stopNotifications();
-          } catch {}
+          } catch (e) {
+            log(`[WARN] Failed to stop notifications cleanly: ${String(e)}`, "warn");
+          }
         }
+
         if (device && device.gatt && device.gatt.connected) {
           device.gatt.disconnect();
         }
       } finally {
-        device = null; server = null; service = null; rxChar = null; txChar = null;
+        device = null;
+        server = null;
+        rxChar = null;
+        txChar = null;
         resetRx();
         setConnectedUi(false);
         setStatus("not connected");
@@ -322,13 +373,16 @@
 
     function onDisconnected() {
       log("[WARN] Device disconnected.", "warn");
+      device = null;
+      server = null;
+      rxChar = null;
+      txChar = null;
+      resetRx();
       setConnectedUi(false);
       setStatus("disconnected", "warn");
-      device = null; server = null; service = null; rxChar = null; txChar = null;
-      resetRx();
     }
 
-    // ===== Wire UI =====
+    // ===== UI events =====
     els.connectBtn.addEventListener("click", connect);
     els.disconnectBtn.addEventListener("click", disconnect);
 
@@ -347,7 +401,10 @@
       await runSequence(CMD.ACTIVATE_DRYER_FULL);
     });
 
+    // Init
     setConnectedUi(false);
+    log(`Reference mapping: Washer 1 = ${WASHER1_ADDRESS}`);
+    log(`Reference mapping: Dryer 4 = ${DRYER4_ADDRESS}`);
   </script>
 </body>
 </html>
