@@ -56,6 +56,7 @@
         Note: Web Bluetooth may not expose/connect by MAC address directly in-browser;
         these are reference mappings from your Python app.
       </p>
+      <p class="small" id="envNote"></p>
     </div>
 
     <div class="card">
@@ -78,7 +79,7 @@
     const RX_UUID = "569a2000-b87f-490c-92cb-11ba5ea5167c"; // notify: device -> host
     const TX_UUID = "569a2001-b87f-490c-92cb-11ba5ea5167c"; // write: host -> device
 
-    // Native-script reference addresses (for display/mapping only)
+    // Native-script reference addresses (display/mapping only)
     const DRYER4_ADDRESS = "30:30:f9:fe:4c:16";
     const WASHER1_ADDRESS = "dc:da:0c:d6:e0:96";
 
@@ -114,6 +115,7 @@
       dryerFullBtn: document.getElementById("dryerFullBtn"),
       status: document.getElementById("status"),
       log: document.getElementById("log"),
+      envNote: document.getElementById("envNote"),
     };
 
     function log(line, cls = "") {
@@ -287,6 +289,12 @@
     }
 
     async function connect() {
+      if (!window.isSecureContext) {
+        log("[ERROR] Web Bluetooth requires HTTPS or localhost.", "bad");
+        setStatus("requires HTTPS/localhost", "bad");
+        return;
+      }
+
       if (!navigator.bluetooth) {
         log("[ERROR] Web Bluetooth not supported in this browser.", "bad");
         setStatus("Web Bluetooth unsupported", "bad");
@@ -297,21 +305,33 @@
         setStatus("connecting...");
         resetRx();
 
-        // 1) Try previously granted devices (no chooser)
-        const granted = await navigator.bluetooth.getDevices();
+        let chosenDevice = null;
 
-        // Prefer familiar names if available; fallback to first granted.
-        const preferred = granted.find(d => {
-          const n = (d.name || "").toLowerCase();
-          return n.includes("washer") || n.includes("dryer") || n.includes("laundry");
-        }) || granted[0];
+        // Optional API (not in all browsers/versions)
+        if (typeof navigator.bluetooth.getDevices === "function") {
+          try {
+            const granted = await navigator.bluetooth.getDevices();
+            chosenDevice =
+              granted.find(d => {
+                const n = (d.name || "").toLowerCase();
+                return n.includes("washer") || n.includes("dryer") || n.includes("laundry");
+              }) || granted[0] || null;
 
-        if (preferred) {
-          device = preferred;
-          log(`[INFO] Reusing granted device: ${device.name || "(unnamed)"}`);
+            if (chosenDevice) {
+              log(`[INFO] Reusing granted device: ${chosenDevice.name || "(unnamed)"}`);
+            } else {
+              log("[INFO] No previously granted devices found; opening chooser.");
+            }
+          } catch (e) {
+            log(`[WARN] getDevices failed, falling back to chooser: ${String(e)}`, "warn");
+          }
         } else {
-          // 2) First time: chooser required
-          device = await navigator.bluetooth.requestDevice({
+          log("[INFO] getDevices() not supported in this browser; opening chooser.");
+        }
+
+        // First time / fallback path
+        if (!chosenDevice) {
+          chosenDevice = await navigator.bluetooth.requestDevice({
             filters: [
               { namePrefix: "WASHER" },
               { namePrefix: "DRYER" },
@@ -319,11 +339,12 @@
               { namePrefix: "Washer" },
               { namePrefix: "Dryer" }
             ],
-            // You may need your actual primary service UUID here for some devices.
+            // NOTE: Some devices need their primary service UUID here.
             optionalServices: [RX_UUID, TX_UUID]
           });
         }
 
+        device = chosenDevice;
         device.addEventListener("gattserverdisconnected", onDisconnected);
 
         server = await device.gatt.connect();
@@ -405,6 +426,19 @@
     setConnectedUi(false);
     log(`Reference mapping: Washer 1 = ${WASHER1_ADDRESS}`);
     log(`Reference mapping: Dryer 4 = ${DRYER4_ADDRESS}`);
+
+    // Environment hint
+    const ua = navigator.userAgent || "";
+    const isFirefox = ua.toLowerCase().includes("firefox");
+    if (isFirefox) {
+      els.envNote.textContent = "You appear to be on Firefox. Web Bluetooth is typically unavailable there; use Chrome/Edge.";
+      log("[WARN] Firefox detected. Use Chrome/Edge for Web Bluetooth.", "warn");
+    } else if (!window.isSecureContext) {
+      els.envNote.textContent = "This page must be served over HTTPS (or localhost) for Web Bluetooth.";
+      log("[WARN] Insecure context detected. Use HTTPS or localhost.", "warn");
+    } else {
+      els.envNote.textContent = "";
+    }
   </script>
 </body>
 </html>
