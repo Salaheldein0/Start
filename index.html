@@ -76,7 +76,7 @@
     const RX_UUID = "569a2000-b87f-490c-92cb-11ba5ea5167c"; // notify: device -> host
     const TX_UUID = "569a2001-b87f-490c-92cb-11ba5ea5167c"; // write: host -> device
 
-    // Reference addresses
+    // Reference info
     const DRYER4_ADDRESS = "30:30:f9:fe:4c:16";
     const WASHER1_ADV_NAME = "AWYDLOOBYZR1";
 
@@ -157,7 +157,6 @@
       return out;
     }
 
-    // Extract frames like [....] from rxBuf
     function extractFramesFromBuffer() {
       const frames = [];
       while (true) {
@@ -166,9 +165,7 @@
           rxBuf = new Uint8Array(0);
           return frames;
         }
-        if (start > 0) {
-          rxBuf = rxBuf.slice(start);
-        }
+        if (start > 0) rxBuf = rxBuf.slice(start);
 
         const end = rxBuf.indexOf("]".charCodeAt(0), 1);
         if (end < 0) return frames;
@@ -242,9 +239,7 @@
       // Equivalent to bleak response=False
       await txChar.writeValueWithoutResponse(bytes);
 
-      if (expectPrefix) {
-        return await waitForPrefix(expectPrefix, timeoutMs);
-      }
+      if (expectPrefix) return await waitForPrefix(expectPrefix, timeoutMs);
       return "";
     }
 
@@ -281,25 +276,9 @@
       }
 
       if (!foundRx || !foundTx) {
-        throw new Error(
-          "Connected, but RX/TX characteristics were not found. Try selecting a different device."
-        );
+        throw new Error("Connected, but RX/TX characteristics were not found. Try selecting a different device.");
       }
       return { foundRx, foundTx };
-    }
-
-    async function requestDeviceWasherFirst() {
-      // Focused chooser first: Washer 1 advertised name
-      return await navigator.bluetooth.requestDevice({
-        filters: [{ name: WASHER1_ADV_NAME }]
-      });
-    }
-
-    async function requestDeviceAnyFallback() {
-      // Fallback chooser: show all nearby BLE devices
-      return await navigator.bluetooth.requestDevice({
-        acceptAllDevices: true
-      });
     }
 
     async function connect() {
@@ -321,7 +300,7 @@
 
         let chosenDevice = null;
 
-        // Optional API (not in all browsers/versions)
+        // Reuse previously granted device if available
         if (typeof navigator.bluetooth.getDevices === "function") {
           try {
             const granted = await navigator.bluetooth.getDevices();
@@ -338,19 +317,14 @@
           } catch (e) {
             log(`[WARN] getDevices failed: ${String(e)}`, "warn");
           }
-        } else {
-          log("[INFO] getDevices() not supported; using chooser.");
         }
 
-        // If not already granted, do washer-focused chooser first, then full fallback chooser
+        // Single chooser fallback (reliable): show all devices
         if (!chosenDevice) {
-          try {
-            log(`[INFO] Opening chooser for Washer 1 (${WASHER1_ADV_NAME})...`);
-            chosenDevice = await requestDeviceWasherFirst();
-          } catch (e) {
-            log("[WARN] Washer-specific chooser didn't return a device. Opening full chooser...", "warn");
-            chosenDevice = await requestDeviceAnyFallback();
-          }
+          log("[INFO] Opening Bluetooth chooser (all nearby devices)...");
+          chosenDevice = await navigator.bluetooth.requestDevice({
+            acceptAllDevices: true
+          });
         }
 
         device = chosenDevice;
@@ -370,7 +344,7 @@
         log(`[INFO] Connected to ${device.name || "device"}`, "ok");
 
         if ((device.name || "") === WASHER1_ADV_NAME) {
-          log("[INFO] Selected device matches Washer 1 advertised name.", "ok");
+          log("[INFO] Selected device matches Washer 1 (AWYDLOOBYZR1).", "ok");
         } else {
           log("[INFO] If this is Dryer 4, continue. If not, disconnect and choose again.", "warn");
         }
@@ -422,7 +396,7 @@
       setStatus("disconnected", "warn");
     }
 
-    // ===== UI events =====
+    // UI events
     els.connectBtn.addEventListener("click", connect);
     els.disconnectBtn.addEventListener("click", disconnect);
 
@@ -446,7 +420,6 @@
     log(`Use Washer 1 (${WASHER1_ADV_NAME})`);
     log(`Use Dryer 4 for address ${DRYER4_ADDRESS}`);
 
-    // Environment hint
     const ua = navigator.userAgent || "";
     const isFirefox = ua.toLowerCase().includes("firefox");
     if (isFirefox) {
